@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "title": "SpasySol",
+  "description": "Guide Spasy through a bright platforming adventure, collecting stars, clearing obstacles, and chasing a new high score.",
+  "defaultCaptions": {
+    "x": "Spasy's adventure begins! Jump over obstacles, collect stars, and chase your best score in SpasySol.",
+    "facebook": "Join Spasy for a bright platforming adventure—jump over obstacles, collect stars, and reach the finish.",
+    "reddit": "SpasySol is a 2D platformer about jumping, collecting stars, and making it through each course.",
+    "discord": "SpasySol is ready to play—jump, collect stars, and make it to the finish!"
+  }
+}
