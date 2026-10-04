@@ -1,0 +1,11 @@
+{
+  "name": "game-platformer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "export": "mkdir -p dist && godot --headless --path . --export-release Web dist/index.html",
+    "verify-export": "node scripts/check-exported-pack.mjs",
+    "check": "node scripts/manus/runtime-command.cjs ./verify.mjs",
+    "test": "godot --headless --path . -s test/smoke.gd"
+  }
+}
