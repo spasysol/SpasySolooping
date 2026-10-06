@@ -1,0 +1,263 @@
+name: Build fixed 100-level web export
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-fixed.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare build scripts
+        shell: bash
+        run: |
+          set -e
+          mkdir -p /tmp/catalog_project/scripts
+          cat > /tmp/catalog_project/project.godot <<'EOF'
+          ; Engine configuration file.
+          config_version=5
+          
+          [application]
+          config/name="SpasySol Catalog Compiler"
+          run/main_scene="res://main.tscn"
+          config/features=PackedStringArray("4.7", "GL Compatibility")
+          
+          [rendering]
+          renderer/rendering_method="gl_compatibility"
+          renderer/rendering_method.mobile="gl_compatibility"
+          EOF
+
+          cat > /tmp/catalog_project/main.gd <<'EOF'
+          extends Node
+          const STAGES = preload("res://scripts/stage_catalog.gd")
+          func _ready():
+              print("Catalog entries: ", STAGES.stages().size())
+          EOF
+
+          cat > /tmp/catalog_project/main.tscn <<'EOF'
+          [gd_scene load_steps=2 format=3]
+          
+          [ext_resource path="res://main.gd" type="Script" id="1"]
+          
+          [node name="Main" type="Node"]
+          script = ExtResource("1")
+          EOF
+
+          python3 - <<'PY'
+          ids = ['sunlit_nook','lofty_lounge'] + [f'level_{i:03d}' for i in range(3,101)]
+          src = '''extends RefCounted
+          ## Ordered 100-level catalog.
+          const STAGES := [%s]
+          const PATH := "res://data/stages/%s.json"
+          static func stages() -> Array:
+              return STAGES.duplicate()
+          static func load_stage(id: String) -> Dictionary:
+              if id not in STAGES:
+                  return {}
+              var file := FileAccess.open(PATH %% id, FileAccess.READ)
+              if file == null:
+                  return {}
+              var parsed: Variant = JSON.parse_string(file.get_as_text())
+              if not parsed is Dictionary or not validate(parsed):
+                  return {}
+              return parsed
+          static func validate(stage: Dictionary) -> bool:
+              for key in ["id","name_key","world_width","spawn","goal","checkpoint","grounds","platforms","trees","blocks","fish","enemies","required_fish"]:
+                  if not stage.has(key): return false
+              if not stage.id is String or stage.id.is_empty() or not stage.name_key is String: return false
+              if not _number(stage.world_width) or float(stage.world_width) < 1000.0 or float(stage.world_width) > 30000.0: return false
+              for key in ["spawn","goal","checkpoint"]:
+                  if not _point(stage[key], float(stage.world_width)): return false
+              for key in ["grounds","platforms","trees"]:
+                  if not stage[key] is Array: return false
+                  for entry: Variant in stage[key]:
+                      if not entry is Array or entry.size() != 2 or not _point(entry[0], float(stage.world_width)) or not _point(entry[1], float(stage.world_width)): return false
+                      if float(entry[1][0]) <= 0.0 or float(entry[1][1]) <= 0.0: return false
+              if stage.grounds.is_empty(): return false
+              for key in ["fish","blocks","enemies"]:
+                  if not stage[key] is Array: return false
+                  for entry: Variant in stage[key]:
+                      if not _point(entry, float(stage.world_width)): return false
+              if not _number(stage.required_fish) or int(stage.required_fish) < 0 or int(stage.required_fish) > stage.fish.size(): return false
+              return true
+          static func _number(value: Variant) -> bool:
+              return (value is int or value is float) and is_finite(float(value))
+          static func _point(value: Variant, width: float) -> bool:
+              return value is Array and value.size() == 2 and _number(value[0]) and _number(value[1]) and float(value[0]) >= 0.0 and float(value[0]) <= width and float(value[1]) >= -1000.0 and float(value[1]) <= 1000.0
+          ''' % ', '.join('"%s"' % x for x in ids)
+          open('/tmp/catalog_project/scripts/stage_catalog.gd','w').write(src)
+          PY
+
+      - name: Compile stage catalog with Godot 4.7.2
+        shell: bash
+        run: |
+          set -e
+          docker run --rm -v /tmp/catalog_project:/project barichello/godot-ci:4.7.2             --headless --path /project --export-pack Linux /project/catalog.pck
+          python3 - <<'PY'
+          import struct, pathlib
+          b=pathlib.Path('/tmp/catalog_project/catalog.pck').read_bytes()
+          base=struct.unpack_from('<Q',b,32)[0]
+          n=struct.unpack_from('<I',b,base)[0]
+          p=base+4
+          found=None
+          for _ in range(n):
+              ln=struct.unpack_from('<I',b,p)[0]; p+=4
+              path=b[p:p+ln].rstrip(b'\0').decode(); p+=ln
+              off,size=struct.unpack_from('<QQ',b,p); p+=16
+              p+=20
+              if path.endswith('scripts/stage_catalog.gdc'):
+                  found=b[off:off+size]
+                  break
+          assert found and found[112:116] == b'GDSC', (found[:16] if found else None)
+          pathlib.Path('/tmp/new_stage_catalog.gdc').write_bytes(found[112:])
+          print('compiled gdc bytes', len(found[112:]))
+          PY
+
+      - name: Generate 98 distinct stages and patch the Web PCK
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, math, hashlib, struct, pathlib, re, shutil, zipfile, os
+          root=pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          src=root/'index.pck'
+          out=root/'SpasySol-Looping-Level100-Fixed.zip'
+          b=src.read_bytes()
+          base=struct.unpack_from('<Q',b,32)[0]
+          n=struct.unpack_from('<I',b,base)[0]
+          p=base+4; entries=[]
+          for _ in range(n):
+              ep=p; ln=struct.unpack_from('<I',b,p)[0]; p+=4
+              raw=b[p:p+ln]; p+=ln; path=raw.rstrip(b'\0').decode()
+              mp=p; off,size=struct.unpack_from('<QQ',b,p); p+=16
+              md5=b[p:p+16]; p+=16; p+=4
+              entries.append(dict(path=path,ep=ep,ln=ln,mp=mp,off=off,size=size,md5=md5))
+          by={e['path']:e for e in entries}
+          assert 'scripts/stage_catalog.gdc' in by
+
+          def level_obj(n):
+              hard=(n-1)/99.0
+              world=min(9300,7600+((n*173)%11)*140+int(hard*900))
+              spawn=[160,540]; goal=[world-220,600]; checkpoint=[int(world*0.50),540]
+              gaps=[85+((n*31+k*47)%86) for k in range(7)]
+              if n>=70:
+                  for k in (2,5): gaps[k]=min(190,gaps[k]+20)
+              segs=[]; x=0
+              base_seg=(world-sum(gaps))//8
+              widths=[base_seg+((n*13+k*29)%121)-60 for k in range(8)]
+              widths=[max(620,w) for w in widths]
+              scale=(world-sum(gaps))/sum(widths)
+              widths=[int(w*scale) for w in widths]
+              widths[-1]+=world-sum(widths)-sum(gaps)
+              for k,w in enumerate(widths):
+                  segs.append([[x,620],[w,150]]); x+=w
+                  if k<7: x+=gaps[k]
+              platforms=[]
+              for k,g in enumerate(gaps):
+                  start=segs[k][0][0]+segs[k][1][0]
+                  width=max(150,min(g+90,280))
+                  y=500-((n*17+k*23)%5)*42
+                  platforms.append([[start+int(g/2)-40,y],[width,34]])
+                  if (n+k)%3==0: platforms.append([[start+g+40,390],[190+((n*7+k*11)%70),34]])
+              for k in range(8):
+                  px=700+((n*271+k*733)%max(1000,world-1400))
+                  py=300+((n*37+k*61)%4)*55
+                  pw=150+((n*19+k*31)%120)
+                  platforms.append([[px,py],[pw,34]])
+              platforms=[q for q in platforms if q[0][0] < world-250]
+              blocks=[]
+              for k in range(6+(n%6)):
+                  bx=520+((n*197+k*613)%(world-1000))
+                  by=460-((n*29+k*43)%3)*70
+                  blocks.append([bx,by])
+              blocks=[q for q in blocks if 350<q[0]<world-500]
+              trees=[]
+              for k in range(3+(n%4)):
+                  trees.append([900+((n*149+k*877)%(world-1300)),540+((n+k)%3)*5])
+              fish=[[360+((n*131+k*277)%(world-600)),500-((n*23+k*31)%5)*42] for k in range(30+(n%9))]
+              enemies=[]
+              enemy_count=7+int(hard*13)+(n%5)
+              for k in range(enemy_count):
+                  enemies.append([750+((n*211+k*557)%(world-1200)),455 if (k+n)%3==0 else 560])
+              return {'id':f'level_{n:03d}','name_key':'stage.sunlit_nook.name' if n%2 else 'stage.lofty_lounge.name','world_width':world,'spawn':spawn,'goal':goal,'checkpoint':checkpoint,'grounds':segs,'platforms':platforms,'trees':trees,'blocks':blocks,'fish':fish,'enemies':enemies,'required_fish':0 if n%2 else min(14,5+n//12)}
+
+          generated={}
+          for n in range(3,101):
+              payload=(json.dumps(level_obj(n),separators=(',',':'))+'\n').encode()
+              generated[f'data/stages/level_{n:03d}.json']=payload
+
+          # Rebuild the PCK so directory offsets/sizes are correct and stage_catalog.gdc is truly updated.
+          new_entries=[]
+          for e in entries:
+              data=b[e['off']:e['off']+e['size']]
+              if e['path']=='scripts/stage_catalog.gdc':
+                  data=b'\0'*112+pathlib.Path('/tmp/new_stage_catalog.gdc').read_bytes()
+              new_entries.append((e['path'],data))
+          existing={p for p,_ in new_entries}
+          for path,data in generated.items():
+              if path not in existing: new_entries.append((path,b'\0'*112+data))
+
+          # Keep PCK version/header before directory, but rewrite all resource payloads contiguously.
+          header_end=base
+          cursor=header_end
+          payloads=[]
+          dir_meta=[]
+          for path,data in new_entries:
+              cursor=(cursor+15)//16*16
+              payloads.append((cursor,data))
+              dir_meta.append((path,cursor,len(data),hashlib.md5(data[112:] if data[:112]==b'\0'*112 else data).digest()))
+              cursor+=len(data)
+
+          dir_start=(cursor+15)//16*16
+          outb=bytearray(b[:header_end])
+          if len(outb)<dir_start: outb.extend(b'\0'*(dir_start-len(outb)))
+          for off,data in payloads:
+              if len(outb)<off: outb.extend(b'\0'*(off-len(outb)))
+              outb.extend(data)
+          if len(outb)<dir_start: outb.extend(b'\0'*(dir_start-len(outb)))
+          # Build directory at the end, matching the original Godot PCK v4 layout.
+          directory=bytearray(struct.pack('<I',len(dir_meta)))
+          for path,off,size,md5 in dir_meta:
+              pb=path.encode()+b'\0'
+              directory += struct.pack('<I',len(pb))+pb
+              directory += struct.pack('<QQ',off,size)+md5+b'\0'*4
+          outb.extend(directory)
+          struct.pack_into('<Q',outb,32,dir_start)
+          struct.pack_into('<I',outb,dir_start, len(dir_meta))
+          pck=root/'index-fixed.pck'
+          pck.write_bytes(outb)
+
+          # Basic structural validation.
+          bb=pck.read_bytes(); bs=struct.unpack_from('<Q',bb,32)[0]; nn=struct.unpack_from('<I',bb,bs)[0]
+          assert nn>=318
+          assert b'data/stages/level_003.json' in bb and b'data/stages/level_100.json' in bb
+          assert b'scripts/stage_catalog.gdc' in bb
+          # Build web export ZIP.
+          shutil.copy2(pck,root/'index.pck')
+          files=[x for x in root.iterdir() if x.is_file() and x.name not in {out.name,'index-fixed.pck'}]
+          with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for f in files: z.write(f,f.name)
+          print(out, out.stat().st_size)
+          PY
+
+      - name: Upload fixed Web build
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpasySol-Looping-Level100-Fixed
+          path: SpasySol-Looping-Level100-Fixed.zip
+          retention-days: 14
+
+      - name: Commit fixed PCK
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.pck
+          git commit -m "Fix 100-level stage catalog and unique level obstacles" || exit 0
+          git push
